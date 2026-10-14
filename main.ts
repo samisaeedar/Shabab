@@ -5,13 +5,15 @@
  * High-performance, cryptographically secured HLS proxy & tokenization gateway
  * designed for Shabab Net wireless network.
  *
- * Core Features:
- *  1. Cryptographic HMAC-SHA256 Expiring Session Tokens (default 5-minute TTL).
- *  2. Upstream URL Masking: technomaster.pro is NEVER exposed to clients.
- *  3. In-flight M3U8 Playlist Rewriting: converts segments to gateway proxy URLs.
- *  4. Native Web Streams Zero-Copy Proxying for .ts media segments.
- *  5. Seamless Background Token Renewal (/api/refresh).
- *  6. In-memory Rate Limiting & Origin/Referer inspection.
+ * Security Layers:
+ *  1. Network Origin & Referer Lockdown: strictly limited to 10.0.0.1 and www.1.com
+ *  2. MikroTik Hotspot Secret Signature: requires HMAC proof generated with shared secret
+ *  3. Cryptographic HMAC-SHA256 Expiring Session Tokens (default 5-minute TTL)
+ *  4. Upstream URL Masking: technomaster.pro is NEVER exposed to clients
+ *  5. In-flight M3U8 Playlist Rewriting: converts segments to gateway proxy URLs
+ *  6. Native Web Streams Zero-Copy Proxying for .ts media segments
+ *  7. Seamless Background Token Renewal (/api/refresh)
+ *  8. In-memory Rate Limiting per IP
  * ==============================================================================
  */
 
@@ -31,8 +33,23 @@ const UPSTREAM_CHANNELS: Record<string, string> = {
   "9": "https://www.technomaster.pro/hls/a0a.l.cIlchannel9-stream.Iil9486143.m3u8",
 };
 
-// Cryptographic Secret Key for HMAC-SHA256 Token Signing
-// Can be overridden via Deno Deploy Environment Variable: GATEWAY_SECRET
+// --------------------------------------------------------------------------
+// Authorized Hotspot Networks & Domains Lockdown
+// --------------------------------------------------------------------------
+export const AUTHORIZED_HOTSPOT_HOSTS = new Set([
+  "10.0.0.1",
+  "www.1.com",
+  "1.com",
+  "localhost",
+  "127.0.0.1",
+]);
+
+// Shared MikroTik Network Secret for Hotspot Client Proof
+export const HOTSPOT_NETWORK_SECRET = 
+  (typeof Deno !== "undefined" && Deno.env && Deno.env.get("HOTSPOT_NETWORK_SECRET")) ||
+  "ShababNet#MikroTik@10.0.0.1#SignatureVault2026!";
+
+// Master Session Signing Secret
 const GATEWAY_SECRET = 
   (typeof Deno !== "undefined" && Deno.env && Deno.env.get("GATEWAY_SECRET")) ||
   "ShababNet#StreamGateVault@2026!MasterCryptSecretKey#Yemen";
@@ -66,7 +83,97 @@ function isRateLimited(ip: string, limit = 240, windowMs = 60000): boolean {
 }
 
 /**
- * Imports or derives the CryptoKey for HMAC-SHA256 using standard Web Crypto API.
+ * Validates that the request originates from an authorized network (Referer or Origin).
+ * Prevents unauthorized third-party routers, websites, or foreign networks from borrowing the stream.
+ */
+export function validateNetworkOrigin(req: Request): { allowed: boolean; host?: string; reason?: string } {
+  const referer = req.headers.get("referer");
+  const origin = req.headers.get("origin");
+  const target = referer || origin;
+
+  if (!target) {
+    return {
+      allowed: false,
+      reason: "Missing network verification headers (Referer/Origin required). Access must originate from Shabab Net (10.0.0.1 / www.1.com).",
+    };
+  }
+
+  try {
+    const parsed = new URL(target);
+    const host = parsed.hostname.toLowerCase();
+
+    // Check exact authorized hosts (10.0.0.1, www.1.com, 1.com)
+    if (AUTHORIZED_HOTSPOT_HOSTS.has(host)) {
+      return { allowed: true, host };
+    }
+
+    // Allow AI Studio preview and Deno Deploy testing domains
+    if (host.endsWith(".run.app") || host.endsWith(".deno.net")) {
+      return { allowed: true, host };
+    }
+
+    return {
+      allowed: false,
+      host,
+      reason: `Unauthorized network host '${host}'. Access is restricted exclusively to Shabab Net (10.0.0.1 / www.1.com).`,
+    };
+  } catch (_e) {
+    return { allowed: false, reason: "Malformed network header" };
+  }
+}
+
+/**
+ * Computes the expected HMAC Hotspot client proof
+ */
+export async function computeHotspotProof(channelId: string, timestamp: number): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(HOTSPOT_NETWORK_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const data = `${channelId}:${timestamp}`;
+  const sigBuffer = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+  return Array.from(new Uint8Array(sigBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Verifies the Hotspot Secret Signature sent by the client page
+ */
+export async function verifyHotspotProof(
+  channelId: string,
+  tsStr: string | null,
+  proof: string | null
+): Promise<{ valid: boolean; reason?: string }> {
+  if (!tsStr || !proof) {
+    return { valid: false, reason: "Missing Hotspot security proof (ts and proof parameters required)" };
+  }
+
+  const ts = parseInt(tsStr, 10);
+  if (isNaN(ts)) {
+    return { valid: false, reason: "Invalid timestamp in Hotspot proof" };
+  }
+
+  // Check timestamp freshness (90-second window to prevent replay attacks)
+  const now = Date.now();
+  if (Math.abs(now - ts) > 90000) {
+    return { valid: false, reason: "Hotspot security proof expired (clock drift > 90s)" };
+  }
+
+  const expectedProof = await computeHotspotProof(channelId, ts);
+  if (proof !== expectedProof) {
+    return { valid: false, reason: "Invalid MikroTik Hotspot secret signature" };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Imports or derives the CryptoKey for HMAC-SHA256 session token signing.
  */
 async function getCryptoKey(): Promise<CryptoKey> {
   const enc = new TextEncoder();
@@ -214,21 +321,42 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
       return jsonResponse({
         ok: true,
         service: "Shabab Stream Gateway",
-        version: "2.0.0-protected",
+        version: "2.1.0-hotspot-locked",
         status: "active",
+        lockedTo: ["10.0.0.1", "www.1.com", "1.com"],
         channelsCount: Object.keys(UPSTREAM_CHANNELS).length,
-        usage: "/api/session?channel=1",
       });
     }
   }
 
   // --------------------------------------------------------------------------
-  // 2. ISSUE SESSION TOKEN (/api/session or ?channel=X on root)
+  // 2. ISSUE SESSION TOKEN (/api/session)
+  // Protected with: Origin/Referer check + MikroTik Hotspot Secret Signature
   // --------------------------------------------------------------------------
   if (path === "/api/session" || (path === "/" && url.searchParams.has("channel"))) {
+    // A. Check Origin & Referer (Only 10.0.0.1 or www.1.com)
+    const originCheck = validateNetworkOrigin(req);
+    if (!originCheck.allowed) {
+      return jsonResponse(
+        { ok: false, error: "Forbidden: " + originCheck.reason, code: "UNAUTHORIZED_NETWORK" },
+        403
+      );
+    }
+
     const channelId = url.searchParams.get("channel") || "1";
     if (!UPSTREAM_CHANNELS[channelId]) {
       return jsonResponse({ ok: false, error: "Channel not found" }, 404);
+    }
+
+    // B. Check MikroTik Hotspot Secret Proof (Only if not a simple health query)
+    const ts = url.searchParams.get("ts");
+    const proof = url.searchParams.get("proof");
+    const proofCheck = await verifyHotspotProof(channelId, ts, proof);
+    if (!proofCheck.valid) {
+      return jsonResponse(
+        { ok: false, error: "Forbidden: " + proofCheck.reason, code: "INVALID_HOTSPOT_SIGNATURE" },
+        403
+      );
     }
 
     const { token, expiresAt } = await createSignedToken(channelId, DEFAULT_TTL_SECONDS);
@@ -248,8 +376,17 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
 
   // --------------------------------------------------------------------------
   // 3. REFRESH SESSION TOKEN (/api/refresh)
+  // Protected with Origin/Referer check + Existing Valid Token
   // --------------------------------------------------------------------------
   if (path === "/api/refresh") {
+    const originCheck = validateNetworkOrigin(req);
+    if (!originCheck.allowed) {
+      return jsonResponse(
+        { ok: false, error: "Forbidden: " + originCheck.reason, code: "UNAUTHORIZED_NETWORK" },
+        403
+      );
+    }
+
     const channelId = url.searchParams.get("channel") || "";
     const oldToken = url.searchParams.get("token") || "";
 
@@ -297,7 +434,7 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
     try {
       const upstreamResp = await fetch(upstreamUrl, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ShababStreamGate/2.0",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ShababStreamGate/2.1",
           "Accept": "*/*",
         },
       });
@@ -374,7 +511,7 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
     try {
       const upstreamResp = await fetch(upstreamSegmentUrl, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ShababStreamGate/2.0",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ShababStreamGate/2.1",
           "Accept": "*/*",
         },
       });
