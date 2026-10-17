@@ -76,6 +76,26 @@ function isRateLimited(ip: string, limit = 240, windowMs = 60000): boolean {
   return entry.count > limit;
 }
 
+// --------------------------------------------------------------------------
+// High-Performance In-Memory Edge Cache for M3U8 & TS Segments
+// Protects Deno Deploy bandwidth/quotas and shields upstream server
+// --------------------------------------------------------------------------
+interface CachedM3U8 {
+  lines: string[];
+  fetchedAt: number;
+}
+const m3u8MemoryCache = new Map<string, CachedM3U8>();
+const M3U8_CACHE_TTL_MS = 2000; // 2 seconds cache for live playlist polling
+
+interface CachedMediaSegment {
+  data: Uint8Array;
+  contentType: string;
+  cachedAt: number;
+}
+const segmentMemoryCache = new Map<string, CachedMediaSegment>();
+const SEGMENT_CACHE_TTL_MS = 35000; // 35 seconds retention
+const MAX_CACHED_SEGMENTS = 50; // Max 50 segments in RAM (~9MB total RAM usage)
+
 /**
  * Validates network origin (Universal Access enabled: allows requests from any host,
  * router IP, custom domain, or privacy-focused browser without Origin/Referer restrictions).
@@ -407,22 +427,36 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
     }
 
     try {
-      const upstreamResp = await fetch(upstreamUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ShababStreamGate/2.1",
-          "Accept": "*/*",
-        },
-      });
+      let lines: string[];
+      const now = Date.now();
+      const cached = m3u8MemoryCache.get(channelId);
 
-      if (!upstreamResp.ok) {
-        return jsonResponse(
-          { ok: false, error: `Upstream stream server returned HTTP ${upstreamResp.status}` },
-          502
-        );
+      if (cached && (now - cached.fetchedAt < M3U8_CACHE_TTL_MS)) {
+        lines = cached.lines;
+      } else {
+        const upstreamResp = await fetch(upstreamUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ShababStreamGate/2.4",
+            "Accept": "*/*",
+          },
+        });
+
+        if (!upstreamResp.ok) {
+          if (cached) {
+            lines = cached.lines;
+          } else {
+            return jsonResponse(
+              { ok: false, error: `Upstream stream server returned HTTP ${upstreamResp.status}` },
+              502
+            );
+          }
+        } else {
+          const m3u8Content = await upstreamResp.text();
+          lines = m3u8Content.split(/\r?\n/);
+          m3u8MemoryCache.set(channelId, { lines, fetchedAt: now });
+        }
       }
 
-      const m3u8Content = await upstreamResp.text();
-      const lines = m3u8Content.split(/\r?\n/);
       const rewrittenLines: string[] = [];
 
       for (const line of lines) {
@@ -450,6 +484,11 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
 
       return m3u8Response(rewrittenLines.join("\n"));
     } catch (err: unknown) {
+      const cached = m3u8MemoryCache.get(channelId);
+      if (cached) {
+        // Fallback to cached playlist on transient network jitter
+        return m3u8Response(cached.lines.join("\n"));
+      }
       const errMsg = err instanceof Error ? err.message : String(err);
       return jsonResponse({ ok: false, error: "Upstream gateway connection failure: " + errMsg }, 502);
     }
@@ -474,6 +513,24 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
       );
     }
 
+    const cacheKey = `${channelId}:${filename}`;
+    const now = Date.now();
+    const cachedSeg = segmentMemoryCache.get(cacheKey);
+
+    // Serve from Fast In-Memory RAM Cache if available
+    if (cachedSeg && (now - cachedSeg.cachedAt < SEGMENT_CACHE_TTL_MS)) {
+      const responseHeaders = new Headers(SECURITY_CORS_HEADERS);
+      responseHeaders.set("content-type", cachedSeg.contentType);
+      responseHeaders.set("content-length", String(cachedSeg.data.byteLength));
+      responseHeaders.set("cache-control", "public, max-age=30, immutable");
+      responseHeaders.set("x-cache", "HIT-DENO-EDGE");
+
+      return new Response(cachedSeg.data as any, {
+        status: 200,
+        headers: responseHeaders,
+      });
+    }
+
     const upstreamBase = UPSTREAM_CHANNELS[channelId];
     if (!upstreamBase) {
       return jsonResponse({ ok: false, error: "Channel not found" }, 404);
@@ -486,7 +543,7 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
     try {
       const upstreamResp = await fetch(upstreamSegmentUrl, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ShababStreamGate/2.1",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ShababStreamGate/2.4",
           "Accept": "*/*",
         },
       });
@@ -498,16 +555,28 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
         );
       }
 
-      // Stream the media bytes directly back to the client
-      const responseHeaders = new Headers(SECURITY_CORS_HEADERS);
-      responseHeaders.set("content-type", upstreamResp.headers.get("content-type") || "video/mp2t");
-      
-      const contentLength = upstreamResp.headers.get("content-length");
-      if (contentLength) {
-        responseHeaders.set("content-length", contentLength);
+      const segmentBuffer = new Uint8Array(await upstreamResp.arrayBuffer());
+      const contentType = upstreamResp.headers.get("content-type") || "video/mp2t";
+
+      // Prune oldest segments if cache limit reached
+      if (segmentMemoryCache.size >= MAX_CACHED_SEGMENTS) {
+        const oldestKey = segmentMemoryCache.keys().next().value;
+        if (oldestKey) segmentMemoryCache.delete(oldestKey);
       }
 
-      return new Response(upstreamResp.body, {
+      segmentMemoryCache.set(cacheKey, {
+        data: segmentBuffer,
+        contentType,
+        cachedAt: now,
+      });
+
+      const responseHeaders = new Headers(SECURITY_CORS_HEADERS);
+      responseHeaders.set("content-type", contentType);
+      responseHeaders.set("content-length", String(segmentBuffer.byteLength));
+      responseHeaders.set("cache-control", "public, max-age=30, immutable");
+      responseHeaders.set("x-cache", "MISS-UPSTREAM");
+
+      return new Response(segmentBuffer as any, {
         status: 200,
         headers: responseHeaders,
       });
