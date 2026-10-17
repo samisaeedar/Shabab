@@ -6,7 +6,7 @@
  * designed for Shabab Net wireless network.
  *
  * Security Layers:
- *  1. Network Origin & Referer Lockdown: strictly limited to 10.0.0.1 and www.1.com
+ *  1. Network Origin & Referer: Universal Access (permits 10.0.0.1, www.1.com, custom domains, and mobile browsers)
  *  2. MikroTik Hotspot Secret Signature: requires HMAC proof generated with shared secret
  *  3. Cryptographic HMAC-SHA256 Expiring Session Tokens (default 5-minute TTL)
  *  4. Upstream URL Masking: technomaster.pro is NEVER exposed to clients
@@ -34,15 +34,9 @@ const UPSTREAM_CHANNELS: Record<string, string> = {
 };
 
 // --------------------------------------------------------------------------
-// Authorized Hotspot Networks & Domains Lockdown
+// Authorized Hotspot Networks & Domains (Universal Access)
 // --------------------------------------------------------------------------
-export const AUTHORIZED_HOTSPOT_HOSTS = new Set([
-  "10.0.0.1",
-  "www.1.com",
-  "1.com",
-  "localhost",
-  "127.0.0.1",
-]);
+export const AUTHORIZED_HOTSPOT_HOSTS = new Set(["*"]);
 
 // Shared MikroTik Network Secret for Hotspot Client Proof
 export const HOTSPOT_NETWORK_SECRET = 
@@ -83,43 +77,24 @@ function isRateLimited(ip: string, limit = 240, windowMs = 60000): boolean {
 }
 
 /**
- * Validates that the request originates from an authorized network (Referer or Origin).
- * Prevents unauthorized third-party routers, websites, or foreign networks from borrowing the stream.
+ * Validates network origin (Universal Access enabled: allows requests from any host,
+ * router IP, custom domain, or privacy-focused browser without Origin/Referer restrictions).
  */
-export function validateNetworkOrigin(req: Request): { allowed: boolean; host?: string; reason?: string } {
-  const referer = req.headers.get("referer");
-  const origin = req.headers.get("origin");
-  const target = referer || origin;
-
-  if (!target) {
-    return {
-      allowed: false,
-      reason: "Missing network verification headers (Referer/Origin required). Access must originate from Shabab Net (10.0.0.1 / www.1.com).",
-    };
-  }
-
-  try {
-    const parsed = new URL(target);
-    const host = parsed.hostname.toLowerCase();
-
-    // Check exact authorized hosts (10.0.0.1, www.1.com, 1.com)
-    if (AUTHORIZED_HOTSPOT_HOSTS.has(host)) {
-      return { allowed: true, host };
+export function validateNetworkOrigin(req?: Request): { allowed: boolean; host?: string; reason?: string } {
+  let host = "*";
+  if (req) {
+    const referer = req.headers.get("referer");
+    const origin = req.headers.get("origin");
+    const target = referer || origin;
+    if (target) {
+      try {
+        host = new URL(target).hostname.toLowerCase();
+      } catch (_e) {
+        host = "unknown";
+      }
     }
-
-    // Allow AI Studio preview and Deno Deploy testing domains
-    if (host.endsWith(".run.app") || host.endsWith(".deno.net")) {
-      return { allowed: true, host };
-    }
-
-    return {
-      allowed: false,
-      host,
-      reason: `Unauthorized network host '${host}'. Access is restricted exclusively to Shabab Net (10.0.0.1 / www.1.com).`,
-    };
-  } catch (_e) {
-    return { allowed: false, reason: "Malformed network header" };
   }
+  return { allowed: true, host };
 }
 
 /**
@@ -321,9 +296,9 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
       return jsonResponse({
         ok: true,
         service: "Shabab Stream Gateway",
-        version: "2.1.0-hotspot-locked",
+        version: "2.2.0-universal-access",
         status: "active",
-        lockedTo: ["10.0.0.1", "www.1.com", "1.com"],
+        lockedTo: "all",
         channelsCount: Object.keys(UPSTREAM_CHANNELS).length,
       });
     }
@@ -334,7 +309,7 @@ export async function handleHttpRequest(req: Request): Promise<Response> {
   // Protected with: Origin/Referer check + MikroTik Hotspot Secret Signature
   // --------------------------------------------------------------------------
   if (path === "/api/session" || (path === "/" && url.searchParams.has("channel"))) {
-    // A. Check Origin & Referer (Only 10.0.0.1 or www.1.com)
+    // A. Check Origin & Referer (Universal Access enabled)
     const originCheck = validateNetworkOrigin(req);
     if (!originCheck.allowed) {
       return jsonResponse(
